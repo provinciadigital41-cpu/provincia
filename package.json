@@ -1,0 +1,10 @@
+{
+  "name": "pipefy-d4sign-netlify-starter",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "netlify dev",
+    "build": "echo 'No build step'",
+    "start": "netlify dev"
+  }
+}
