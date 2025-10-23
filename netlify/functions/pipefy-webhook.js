@@ -1,176 +1,142 @@
 // netlify/functions/pipefy-webhook.js
-// Função Netlify: Pipefy -> (mapeia campos) -> ADD do D4Sign -> (opcional) cria doc por template Word
-
-// GET: responde no navegador para teste rápido
-// POST: recebe { cardId } ou payload de webhook do Pipefy, busca GraphQL e (opcional) chama D4Sign
+// Fluxo: checkbox "gerar_contrato" => gera doc no D4Sign => adiciona signatários => envia p/ assinatura
+// => salva link no card => move p/ fase "Contrato enviado"
+// Obs.: para mover p/ "Contrato assinado", use o webhook do D4Sign (ver notas ao final).
 
 export async function handler(event) {
   try {
     if (event.httpMethod === "GET") {
-      return text(200, "OK - use POST com JSON { cardId } ou payload do Pipefy");
+      return text(200, "OK - use POST com JSON { cardId }");
     }
+    if (event.httpMethod !== "POST") return text(405, "Method Not Allowed");
 
-    if (event.httpMethod !== "POST") {
-      return text(405, "Method Not Allowed");
-    }
-
-    // -------- entrada --------
-    const body = parseJSON(event.body) || {};
-    // tenta vários caminhos comuns do webhook do Pipefy
+    const body = safeJson(event.body) || {};
     const cardId =
       body?.data?.card?.id ??
       body?.card?.id ??
       body?.data?.id ??
       body?.cardId ??
       null;
+    if (!cardId) return json(400, { error: "cardId ausente" });
 
-    if (!cardId) {
-      return json(400, {
-        error: "cardId ausente",
-        hint: "Envie { cardId: \"123\" } ou payload do webhook do Pipefy (data.card.id)."
-      });
-    }
-
-    // -------- busca no Pipefy (GraphQL) --------
+    // === Pipefy: buscar card ===
     const PIPEFY_TOKEN = process.env.PIPEFY_TOKEN;
-    if (!PIPEFY_TOKEN) {
-      return json(500, { error: "Env var PIPEFY_TOKEN não configurada no Netlify." });
-    }
+    if (!PIPEFY_TOKEN) return json(500, { error: "PIPEFY_TOKEN ausente" });
 
-    const PIPEFY_GQL = "https://api.pipefy.com/graphql";
-    const QUERY = /* GraphQL */ `
+    const gql = (query, variables) =>
+      fetch("https://api.pipefy.com/graphql", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${PIPEFY_TOKEN}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ query, variables })
+      }).then(r => r.json());
+
+    const CARD_Q = `
       query($cardId: ID!) {
         card(id: $cardId) {
           id
           title
-          fields {
-            name
-            value
-            report_value
-            field { id }
-          }
+          fields { name value report_value field { id } }
         }
       }
     `;
-
-    const gqlResp = await fetch(PIPEFY_GQL, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${PIPEFY_TOKEN}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ query: QUERY, variables: { cardId } })
-    });
-
-    const gqlJson = await gqlResp.json();
-    if (!gqlResp.ok || gqlJson?.errors) {
-      return json(502, { error: "Erro no GraphQL do Pipefy", details: gqlJson?.errors || await gqlResp.text() });
-    }
-
-    const card = gqlJson?.data?.card;
+    const cardRes = await gql(CARD_Q, { cardId });
+    if (cardRes.errors) return json(502, { error: "GraphQL Pipefy", details: cardRes.errors });
+    const card = cardRes?.data?.card;
     const fields = card?.fields || [];
 
-    // -------- mapeamento dos campos --------
+    // === montar dados / ADD ===
     const dados = montarDadosContrato(fields);
     const ADD = montarADD(dados);
 
-    // -------- (opcional) criar documento no D4Sign por template Word --------
-    const D4_ENABLED = hasAll([
-      process.env.D4_TOKEN,
-      process.env.D4_CRYPT,
-      process.env.D4_UUID_SAFE,
-      process.env.D4_ID_TEMPLATE_WORD
-    ]);
+    // === D4Sign: criar doc por template Word ===
+    const d4 = await gerarDocumentoD4(ADD, dados);
+    if (!d4?.sent) {
+      return json(502, { error: "Falha ao criar documento no D4Sign", d4 });
+    }
+    const uuidDoc = d4?.response?.uuid || d4?.response?.uuidDoc || d4?.response?.uuid_document; // compat
 
-    let d4sign = {
-      enabled: D4_ENABLED,
-      note: D4_ENABLED
-        ? "D4Sign: variáveis presentes; tentativa de criação do documento."
-        : "D4Sign: variáveis ausentes; não foi feita chamada à API."
-    };
+    // === D4Sign: adicionar signatários e enviar p/ assinatura ===
+    const addS = await d4AddSigners(uuidDoc);
+    if (addS?.error) return json(502, { error: "Falha ao adicionar signatários", addS });
 
-    if (D4_ENABLED) {
-      try {
-        d4sign = await gerarContratoNoD4Sign(ADD, dados);
-      } catch (e) {
-        d4sign = { enabled: true, sent: false, error: String(e) };
-      }
+    const send = await d4SendToSign(uuidDoc);
+    if (send?.error) return json(502, { error: "Falha ao enviar para assinatura", send });
+
+    // D4Sign costuma devolver link público do documento (ou você pode montar via painel).
+    const linkContrato = d4?.response?.url || d4?.response?.url_document || null;
+
+    // === Pipefy: salvar link no campo (default: 'documentos') ===
+    const LINK_FIELD = process.env.PIPEFY_FIELD_LINK_CONTRATO || "documentos";
+    if (linkContrato) {
+      const MUT_UPDATE = `
+        mutation($card_id: ID!, $field_id: String!, $value: String!) {
+          updateCardField(input: { card_id: $card_id, field_id: $field_id, new_value: $value }) { success }
+        }
+      `;
+      await gql(MUT_UPDATE, { card_id: cardId, field_id: LINK_FIELD, value: linkContrato });
     }
 
-    // -------- resposta --------
+    // (Opcional) resetar checkbox para evitar duplicidade
+    // try { await gql(MUT_UPDATE, { card_id: cardId, field_id: "gerar_contrato", value: "false" }); } catch {}
+
+    // === Pipefy: mover card para "Contrato enviado" ===
+    const DEST_PHASE = process.env.PIPEFY_PHASE_CONTRATO_ENVIADO;
+    if (DEST_PHASE) {
+      const MOVE_MUT = `
+        mutation($card_id: ID!, $dest: ID!) {
+          moveCardToPhase(input: { card_id: $card_id, destination_phase_id: $dest }) { card { id } }
+        }
+      `;
+      await gql(MOVE_MUT, { card_id: cardId, dest: DEST_PHASE });
+    }
+
     return json(200, {
       ok: true,
       cardId,
       cardTitle: card?.title || null,
-      dados,      // valores normalizados do card
-      ADD,        // chaves para o template do D4Sign
-      d4sign      // resultado (ou motivo de não envio)
+      linkContrato,
+      d4sign: { create: d4, addSigners: addS, sendToSign: send }
     });
 
-  } catch (err) {
-    return json(500, { error: String(err) });
+  } catch (e) {
+    return json(500, { error: String(e) });
   }
 }
 
-/* ===================== helpers ===================== */
+/* ================= helpers ================= */
 
-function parseJSON(str) { try { return JSON.parse(str); } catch { return null; } }
-
-function text(statusCode, body) {
-  return { statusCode, headers: { "Content-Type": "text/plain; charset=utf-8" }, body };
-}
-
-function json(statusCode, obj) {
-  return { statusCode, headers: { "Content-Type": "application/json" }, body: JSON.stringify(obj, null, 2) };
-}
-
-function hasAll(arr) { return arr.every(Boolean); }
-
+function safeJson(s) { try { return JSON.parse(s); } catch { return null; } }
+function text(status, body) { return { statusCode: status, headers: { "Content-Type": "text/plain; charset=utf-8" }, body }; }
+function json(status, obj) { return { statusCode: status, headers: { "Content-Type": "application/json" }, body: JSON.stringify(obj, null, 2) }; }
 const toStr = v => (v == null ? null : String(v).trim());
 
 function getField(fields, fieldId) {
   const f = fields.find(x => x.field?.id === fieldId);
   return f?.report_value ?? f?.value ?? null;
 }
-
-// "2.460,00" -> 2460.00
-function parseCurrencyBRL(input) {
-  if (!input) return null;
-  const s = String(input).replace(/\./g, "").replace(",", ".");
-  const n = Number(s);
+function parseCurrencyBRL(s) {
+  if (!s) return null;
+  const n = Number(String(s).replace(/\./g, "").replace(",", "."));
   return Number.isFinite(n) ? Number(n.toFixed(2)) : null;
 }
-
-// "10X" -> 10
-function parseParcelas(input) {
-  if (!input) return null;
-  const m = String(input).match(/(\d+)/);
-  return m ? Number(m[1]) : null;
+function parseParcelas(s) { const m = String(s||"").match(/(\d+)/); return m ? Number(m[1]) : null; }
+function parseTaxa(s) {
+  if (!s) return { categoria: null, valor: null };
+  const cat = String(s).split("(")[0].trim();
+  const m = String(s).match(/R\$\s*([\d\.\,]+)/i);
+  const valor = m ? parseCurrencyBRL(m[1]) : null;
+  return { categoria: cat || null, valor };
+}
+function parseDocumentoURL(v) {
+  if (!v) return null;
+  try { if (String(v).trim().startsWith("[")) { const arr = JSON.parse(v); return Array.isArray(arr) ? arr[0] ?? null : null; } } catch {}
+  return String(v);
 }
 
-// "MEI/ME/EPP/PF (R$440,00)" -> { categoria, valor }
-function parseTaxa(input) {
-  if (!input) return { categoria: null, valor: null };
-  const s = String(input);
-  const categoria = s.split("(")[0].trim() || null;
-  const valMatch = s.match(/R\$\s*([\d\.\,]+)/i);
-  const valor = valMatch ? parseCurrencyBRL(valMatch[1]) : null;
-  return { categoria: categoria || null, valor };
-}
-
-function parseDocumentoURL(input) {
-  if (!input) return null;
-  try {
-    if (String(input).trim().startsWith("[")) {
-      const arr = JSON.parse(input);
-      return Array.isArray(arr) ? arr[0] ?? null : null;
-    }
-  } catch {}
-  return String(input);
-}
-
-/* ====== mapeamento de campos do seu pipe ======
-   Ajuste os field_ids abaixo se necessário. */
+// ====== mapeamento conforme seus cards anteriores ======
 function montarDadosContrato(fields) {
   const nome               = toStr(getField(fields, "nome_do_contato"));
   const nome_da_marca      = toStr(getField(fields, "neg_cio"));
@@ -179,15 +145,15 @@ function montarDadosContrato(fields) {
   const valorBruto         = getField(fields, "valor_do_neg_cio");
   const qtdParcelasRaw     = getField(fields, "quantidade_de_parcelas");
   const servicos           = toStr(getField(fields, "servi_os_de_contratos"));
-  const pesquisa           = toStr(getField(fields, "paga"));            // "Isenta", etc.
-  const taxaRaw            = getField(fields, "copy_of_pesquisa");       // "MEI/ME/EPP/PF (R$440,00)"
+  const pesquisa           = toStr(getField(fields, "paga"));
+  const taxaRaw            = getField(fields, "copy_of_pesquisa");
   const cep                = toStr(getField(fields, "cep"));
   const uf                 = toStr(getField(fields, "uf"));
   const cidade             = toStr(getField(fields, "cidade"));
-  const bairro             = toStr(getField(fields, "bairro"));          // pode não existir em alguns cards
+  const bairro             = toStr(getField(fields, "bairro"));
   const rua                = toStr(getField(fields, "rua"));
   const numero             = toStr(getField(fields, "n_mero"));
-  const cnpj               = toStr(getField(fields, "cnpj"));            // pode não existir em alguns cards
+  const cnpj               = toStr(getField(fields, "cnpj"));
   const docUrl             = parseDocumentoURL(getField(fields, "documentos"));
 
   const valor_do_negocio   = parseCurrencyBRL(valorBruto);
@@ -195,29 +161,15 @@ function montarDadosContrato(fields) {
   const { categoria: taxa, valor: taxa_valor } = parseTaxa(taxaRaw);
 
   return {
-    nome,
-    nome_da_marca,
-    telefone,
-    email,
-    valor_do_negocio,
-    quantidade_de_parcelas,
-    servicos_de_contrato: servicos,
-    pesquisa,
-    taxa,
-    taxa_valor,
-    cnpj,
-    cep,
-    uf,
-    cidade,
-    bairro,
-    rua,
-    numero,
+    nome, nome_da_marca, telefone, email,
+    valor_do_negocio, quantidade_de_parcelas,
+    servicos_de_contrato: servicos, pesquisa, taxa, taxa_valor,
+    cnpj, cep, uf, cidade, bairro, rua, numero,
     documento_url: docUrl
   };
 }
 
 function montarADD(d) {
-  // ajuste as chaves para baterem com os placeholders do seu template D4Sign
   return {
     nome: d.nome,
     nome_da_marca: d.nome_da_marca,
@@ -239,22 +191,21 @@ function montarADD(d) {
   };
 }
 
-/* ========== D4Sign (opcional) ========== */
-/* Cria documento por template Word. Para ativar:
-   - defina no Netlify (Environment variables):
-     D4_TOKEN, D4_CRYPT, D4_UUID_SAFE, D4_ID_TEMPLATE_WORD
-   - garanta que seu template Word usa placeholders compatíveis com ADD
-*/
-async function gerarContratoNoD4Sign(ADD, dados) {
-  const D4_BASE = "https://sandbox.d4sign.com.br/api/v1"; // troque para produção se aplicável
+/* ========== D4Sign ========== */
+
+async function gerarDocumentoD4(ADD, dados) {
+  const D4_BASE = "https://sandbox.d4sign.com.br/api/v1";
   const tokenAPI = process.env.D4_TOKEN;
   const cryptKey = process.env.D4_CRYPT;
   const uuidSafe = process.env.D4_UUID_SAFE;
   const idTemplateWord = process.env.D4_ID_TEMPLATE_WORD;
 
-  const url = `${D4_BASE}/documents/${uuidSafe}/makedocumentbytemplateword?tokenAPI=${tokenAPI}&cryptKey=${cryptKey}`;
+  if (!tokenAPI || !cryptKey || !uuidSafe || !idTemplateWord) {
+    return { sent: false, reason: "vars D4 incompletas" };
+  }
 
-  const bodyD4 = {
+  const url = `${D4_BASE}/documents/${uuidSafe}/makedocumentbytemplateword?tokenAPI=${tokenAPI}&cryptKey=${cryptKey}`;
+  const body = {
     name_document: `Contrato - ${dados.nome_da_marca || dados.nome || "Sem Nome"}`,
     uuid_folder: null,
     id_template: [idTemplateWord],
@@ -264,16 +215,43 @@ async function gerarContratoNoD4Sign(ADD, dados) {
   const r = await fetch(url, {
     method: "POST",
     headers: { "accept": "application/json", "content-type": "application/json" },
-    body: JSON.stringify(bodyD4)
+    body: JSON.stringify(body)
   });
-
   const out = await r.json().catch(() => ({}));
 
-  return {
-    enabled: true,
-    sent: r.ok,
-    status: r.status,
-    response: out
-  };
+  return { sent: r.ok, status: r.status, response: out };
 }
 
+// adiciona signatários (usa env D4_SIGNERS como JSON)
+async function d4AddSigners(uuidDoc) {
+  const D4_BASE = "https://sandbox.d4sign.com.br/api/v1";
+  const tokenAPI = process.env.D4_TOKEN;
+  const cryptKey = process.env.D4_CRYPT;
+  const signers = safeJson(process.env.D4_SIGNERS || "[]") || [];
+
+  if (!uuidDoc) return { error: "uuidDoc ausente" };
+  if (!signers.length) return { error: "D4_SIGNERS vazio" };
+
+  const url = `${D4_BASE}/documents/${uuidDoc}/addsigner?tokenAPI=${tokenAPI}&cryptKey=${cryptKey}`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "accept": "application/json", "content-type": "application/json" },
+    body: JSON.stringify(signers)
+  });
+  const out = await r.json().catch(() => ({}));
+  return r.ok ? { ok: true, response: out } : { error: true, status: r.status, response: out };
+}
+
+// envia para assinatura
+async function d4SendToSign(uuidDoc) {
+  const D4_BASE = "https://sandbox.d4sign.com.br/api/v1";
+  const tokenAPI = process.env.D4_TOKEN;
+  const cryptKey = process.env.D4_CRYPT;
+
+  if (!uuidDoc) return { error: "uuidDoc ausente" };
+
+  const url = `${D4_BASE}/documents/${uuidDoc}/sendtosigner?tokenAPI=${tokenAPI}&cryptKey=${cryptKey}`;
+  const r = await fetch(url, { method: "POST" });
+  const out = await r.json().catch(() => ({}));
+  return r.ok ? { ok: true, response: out } : { error: true, status: r.status, response: out };
+}
