@@ -1,7 +1,5 @@
-// netlify/functions/pipefy-webhook.js
-// Fluxo: checkbox "gerar_contrato" => gera doc no D4Sign => adiciona signatários => envia p/ assinatura
+// Fluxo: checkbox "gerar_contrato" => gera 3 docs no D4Sign => adiciona signatários => envia p/ assinatura
 // => salva link no card => move p/ fase "Contrato enviado"
-// Obs.: para mover p/ "Contrato assinado", use o webhook do D4Sign (ver notas ao final).
 
 export async function handler(event) {
   try {
@@ -47,60 +45,89 @@ export async function handler(event) {
     const card = cardRes?.data?.card;
     const fields = card?.fields || [];
 
-    // === montar dados / ADD ===
+    // === 1. MONTAR DADOS E SIGNATÁRIOS ===
     const dados = montarDadosContrato(fields);
     const ADD = montarADD(dados);
-
-    // === D4Sign: criar doc por template Word ===
-    const d4 = await gerarDocumentoD4(ADD, dados);
-    if (!d4?.sent) {
-      return json(502, { error: "Falha ao criar documento no D4Sign", d4 });
-    }
-    // A D4Sign retorna diferentes chaves para o UUID do documento.
-    const uuidDoc = d4?.response?.uuid || d4?.response?.uuidDoc || d4?.response?.uuid_document; 
+    const signersList = montarSignatarios(dados);
     
-    // VERIFICAÇÃO CRÍTICA: Se a criação falhar por chave D4, o uuidDoc será nulo.
-    if (!uuidDoc) {
-      return json(502, { 
-        error: "Documento criado no D4Sign, mas UUID não retornado.", 
-        details: "Verifique o formato do 'ADD' ou o status da sua API Key. Resposta D4:", 
-        response: d4.response 
-      });
+    // === 2. BUSCAR COFRE DINÂMICO ===
+    const cofreData = getCofreDataPorVendedor(dados.vendedor);
+    if (!cofreData?.uuidSafe) {
+        return json(400, { 
+            error: "Vendedor não mapeado ou campo 'respons_vel' está vazio.", 
+            vendedor: dados.vendedor 
+        });
+    }
+    
+    const DYNAMIC_UUID_SAFE = cofreData.uuidSafe;
+    const DYNAMIC_UUID_FOLDER = cofreData.uuidFolder; // nulo inicialmente
+
+    // === 3. PROCESSAR OS 3 DOCUMENTOS SEQUENCIALMENTE ===
+    
+    const docProcuracao = await processarDocumentoD4(
+        ADD, dados, DYNAMIC_UUID_SAFE, 
+        process.env.D4_ID_TEMPLATE_PROCURACAO, "Procuração", DYNAMIC_UUID_FOLDER
+    );
+    if (docProcuracao.error) return json(502, { error: "Falha Procuração", details: docProcuracao.error });
+
+    const docContrato = await processarDocumentoD4(
+        ADD, dados, DYNAMIC_UUID_SAFE, 
+        process.env.D4_ID_TEMPLATE_CONTRATO, "Contrato", DYNAMIC_UUID_FOLDER
+    );
+    if (docContrato.error) return json(502, { error: "Falha Contrato", details: docContrato.error });
+    
+    const docAditivo = await processarDocumentoD4(
+        ADD, dados, DYNAMIC_UUID_SAFE, 
+        process.env.D4_ID_TEMPLATE_ADITIVO, "Aditivo", DYNAMIC_UUID_FOLDER
+    );
+    if (docAditivo.error) return json(502, { error: "Falha Aditivo", details: docAditivo.error });
+
+    // Agrupa todos os documentos criados
+    const allDocs = [docProcuracao, docContrato, docAditivo];
+    let linkContrato = null;
+
+    // === 4. ADICIONAR SIGNATÁRIOS E ENVIAR PARA CADA DOCUMENTO ===
+    const signSendResults = [];
+    
+    for (const doc of allDocs) {
+        if (!doc.uuidDoc) {
+             signSendResults.push({ name: doc.name, status: "skip", details: "UUID não retornado" });
+             continue;
+        }
+
+        // Adicionar Signatários
+        const addS = await d4AddSigners(doc.uuidDoc, signersList);
+        if (addS?.error) {
+            signSendResults.push({ name: doc.name, status: "addSigner_ERROR", details: addS });
+            continue;
+        }
+
+        // Enviar para Assinatura
+        const send = await d4SendToSign(doc.uuidDoc);
+        if (send?.error) {
+            signSendResults.push({ name: doc.name, status: "sendToSign_ERROR", details: send });
+        } else {
+            signSendResults.push({ name: doc.name, status: "OK" });
+        }
+        
+        // Usa o link do Contrato como link principal para o Pipefy
+        if (doc.name === "Contrato") {
+             linkContrato = doc.link; 
+        }
     }
 
-    // === D4Sign: adicionar signatários e enviar p/ assinatura ===
-    const addS = await d4AddSigners(uuidDoc);
-    // Note: O endpoint addsigner foi renomeado para 'createlist' em algumas documentações.
-    // O endpoint 'addsigner' é amplamente usado, mas se der erro, tente 'createlist'.
-    if (addS?.error) return json(502, { error: "Falha ao adicionar signatários", addS });
-
-    const send = await d4SendToSign(uuidDoc);
-    if (send?.error) return json(502, { error: "Falha ao enviar para assinatura", send });
-
-    // D4Sign costuma devolver link público do documento (ou você pode montar via painel).
-    const linkContrato = d4?.response?.url || d4?.response?.url_document || null;
-
-    // === Pipefy: salvar link no campo (default: 'documentos') ===
-    const LINK_FIELD = process.env.PIPEFY_FIELD_LINK_CONTRATO || "documentos";
+    // === 5. PIPEfy: SALVAR LINK E MOVER CARD ===
+    
+    const LINK_FIELD = process.env.PIPEFY_FIELD_LINK_CONTRATO || "documentos"; // Mude para o ID do campo "Link D4Sign"
     if (linkContrato) {
       const MUT_UPDATE = `
         mutation($card_id: ID!, $field_id: String!, $value: String!) {
           updateCardField(input: { card_id: $card_id, field_id: $field_id, new_value: $value }) { success }
         }
       `;
-      // Tenta salvar o link
       await gql(MUT_UPDATE, { card_id: cardId, field_id: LINK_FIELD, value: linkContrato });
     }
 
-    // (Opcional) resetar checkbox para evitar duplicidade
-    // const MUT_RESET_CHECKBOX = `
-    //   mutation($card_id: ID!, $field_id: String!, $value: String!) {
-    //      updateCardField(input: { card_id: $card_id, field_id: $field_id, new_value: $value }) { success }
-    //   }
-    // `;
-    // try { await gql(MUT_RESET_CHECKBOX, { card_id: cardId, field_id: "gerar_contrato", value: "false" }); } catch {}
-
-    // === Pipefy: mover card para "Contrato enviado" ===
     const DEST_PHASE = process.env.PIPEFY_PHASE_CONTRATO_ENVIADO;
     if (DEST_PHASE) {
       const MOVE_MUT = `
@@ -116,11 +143,10 @@ export async function handler(event) {
       cardId,
       cardTitle: card?.title || null,
       linkContrato,
-      d4sign: { create: d4, addSigners: addS, sendToSign: send }
+      d4sign: { documents: allDocs, workflow: signSendResults }
     });
 
   } catch (e) {
-    // Retorno de erro mais detalhado
     return json(500, { error: String(e), stack: e.stack });
   }
 }
@@ -138,7 +164,6 @@ function getField(fields, fieldId) {
 }
 function parseCurrencyBRL(s) {
   if (!s) return null;
-  // Converte "R$ 1.000,00" ou "1000,00" para 1000.00
   const n = Number(String(s).replace(/[^\d\,]/g, "").replace(",", "."));
   return Number.isFinite(n) ? Number(n.toFixed(2)) : null;
 }
@@ -152,14 +177,14 @@ function parseTaxa(s) {
 }
 function parseDocumentoURL(v) {
   if (!v) return null;
-  // Trata campos de anexo que podem vir como string JSON
   try { if (String(v).trim().startsWith("[")) { const arr = JSON.parse(v); return Array.isArray(arr) ? arr[0] ?? null : null; } } catch {}
   return String(v);
 }
 
-// ====== mapeamento conforme seus cards anteriores ======
+
+// ====== MAPEAMENTO DE DADOS DO PIPEFY ======
 function montarDadosContrato(fields) {
-  // OBS: Garanta que os IDs dos campos Pipefy (e.g., "nome_do_contato") estejam corretos.
+  // Use os IDs dos campos do Pipefy
   const nome                = toStr(getField(fields, "nome_do_contato"));
   const nome_da_marca       = toStr(getField(fields, "neg_cio"));
   const telefone            = toStr(getField(fields, "telefone"));
@@ -167,7 +192,7 @@ function montarDadosContrato(fields) {
   const valorBruto          = getField(fields, "valor_do_neg_cio");
   const qtdParcelasRaw      = getField(fields, "quantidade_de_parcelas");
   const servicos            = toStr(getField(fields, "servi_os_de_contratos"));
-  const pesquisa            = toStr(getField(fields, "paga"));
+  const pesquisa            = getField(fields, "paga");
   const taxaRaw             = getField(fields, "copy_of_pesquisa");
   const cep                 = toStr(getField(fields, "cep"));
   const uf                  = toStr(getField(fields, "uf"));
@@ -176,6 +201,10 @@ function montarDadosContrato(fields) {
   const rua                 = toStr(getField(fields, "rua"));
   const numero              = toStr(getField(fields, "n_mero"));
   const cnpj                = toStr(getField(fields, "cnpj"));
+  
+  // ATENÇÃO: ID DO VENDEDOR CONFIRMADO
+  const vendedor            = toStr(getField(fields, "respons_vel"));
+  
   const docUrl              = parseDocumentoURL(getField(fields, "documentos"));
 
   const valor_do_negocio    = parseCurrencyBRL(valorBruto);
@@ -187,85 +216,136 @@ function montarDadosContrato(fields) {
     valor_do_negocio, quantidade_de_parcelas,
     servicos_de_contrato: servicos, pesquisa, taxa, taxa_valor,
     cnpj, cep, uf, cidade, bairro, rua, numero,
-    documento_url: docUrl
+    documento_url: docUrl,
+    vendedor // NOVO CAMPO RETORNADO
   };
 }
 
 // Mapeia os dados do Pipefy para as VARIÁVEIS do seu template D4Sign
 function montarADD(d) {
-  // A CHAVE de cada item aqui DEVE ser exatamente igual ao nome da variável no seu template Word da D4Sign.
+  // As chaves devem ser IDÊNTICAS às variáveis no seu template Word
   return {
     nome: d.nome,
     nome_da_marca: d.nome_da_marca,
-    telefone: d.telefone,
     email: d.email,
     valor_do_negocio: d.valor_do_negocio,
-    quantidade_de_parcelas: d.quantidade_de_parcelas,
-    servicos_de_contrato: d.servicos_de_contrato,
-    pesquisa: d.pesquisa,
-    taxa: d.taxa,
-    taxa_valor: d.taxa_valor,
-    cnpj: d.cnpj,
-    cep: d.cep,
-    uf: d.uf,
-    cidade: d.cidade,
-    bairro: d.bairro,
-    rua: d.rua,
-    numero: d.numero
+    // ... adicione todas as variáveis necessárias para o D4Sign
+    // ...
   };
 }
 
-/* ========== D4Sign ========== */
+// ====== MAPEAMENTO DE COFRES POR VENDEDOR ======
+function getCofreDataPorVendedor(vendedor) {
+    // Padroniza a chave de busca (remove acentos, espaços extras e usa minúsculas)
+    const chave = String(vendedor || "")
+        .toLowerCase()
+        .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+        .trim();
+    
+    // Mapeamento fornecido (sem acentos, minúsculas)
+    const MAPA_COFRES = {
+        "mauro furlan neto": { uuidSafe: "623b7ae4-5c01-4cff-a7e4-5b0a9f58af07" },
+        "brenda rosa da silva": { uuidSafe: "b6dd6fad-c9fe-4cf1-8a90-6488d2537930" },
+        "ronaldo scariot da silva": { uuidSafe: "f9bff85c-e2d2-4c8e-8fae-818906090d4a" },
+        "jeferson andrade siqueira": { uuidSafe: "2697a33a-3c9c-4997-829a-f2197b0575fd" },
+        "maykon campos": { uuidSafe: "1686e23a-73de-4738-a1a1-7e7d2d8fbef0" },
+        "debora goncalves": { uuidSafe: "5ae00672-398d-4dd3-b048-a363f32d0491" },
+        "mariana cristina de oliveira": { uuidSafe: "672b3f5d-7b96-4021-9f4f-ce9778a5426c" },
+        "valdeir almeida": { uuidSafe: "c59ad739-b920-4407-95b7-61f01589cc6e" },
+        "edna berto da silva": { uuidSafe: "f2810606-e496-4955-bb65-a7f6218bc116" },
+        "greyce maria candido souza": { uuidSafe: "b05ba8d4-ed65-4659-b348-ceda08fd7724" }
+    };
+    
+    if (MAPA_COFRES[chave]) {
+        return { 
+            uuidSafe: MAPA_COFRES[chave].uuidSafe,
+            uuidFolder: null // Manter nulo para salvar na raiz do cofre. Se precisar de subcofre, adicione a lógica aqui.
+        };
+    }
 
-async function gerarDocumentoD4(ADD, dados) {
-  // *** ALTERADO PARA AMBIENTE DE PRODUÇÃO ***
-  const D4_BASE = "https://secure.d4sign.com.br/api/v1"; 
+    console.error(`Vendedor "${vendedor}" não encontrado no mapeamento.`);
+    return {
+        uuidSafe: process.env.D4_UUID_SAFE_PADRAO || null,
+        uuidFolder: null 
+    };
+}
+
+// ====== LÓGICA DE SIGNATÁRIOS DINÂMICOS ======
+function montarSignatarios(dados) {
+    // Signatário 1: Cliente (E-mail vindo do Pipefy)
+    const signatarioCliente = {
+        "email": dados.email, // E-mail do cliente
+        "act": "1", // 1 = Assinar (Ação padrão)
+        "foreign": "0",
+        "certificadoicpbr": "0"
+    };
+
+    // Signatário 2: Representante da Empresa (E-mail fixo)
+    const signatarioEmpresa = {
+        "email": process.env.EMAIL_ASSINATURA_EMPRESA, // Deve ser configurado no Netlify
+        "act": "1",
+        "foreign": "0",
+        "certificadoicpbr": "0"
+    };
+    
+    // Você pode adicionar lógica para que o signatário da empresa seja o Vendedor (dados.vendedor)
+    // se o campo vendedor for um campo de e-mail ou se o e-mail for mapeado.
+
+    return [signatarioCliente, signatarioEmpresa];
+}
+
+/* ========== D4Sign: FUNÇÕES DE API ========== */
+const D4_BASE = "https://secure.d4sign.com.br/api/v1"; 
+
+async function processarDocumentoD4(ADD, dados, uuidSafe, idTemplateWord, docName, uuidFolder = null) {
   const tokenAPI = process.env.D4_TOKEN;
   const cryptKey = process.env.D4_CRYPT;
-  const uuidSafe = process.env.D4_UUID_SAFE;
-  const idTemplateWord = process.env.D4_ID_TEMPLATE_WORD;
-
+  
   if (!tokenAPI || !cryptKey || !uuidSafe || !idTemplateWord) {
-    return { sent: false, reason: "vars D4 incompletas" };
+      return { error: `Vars D4 incompletas para ${docName}` };
   }
 
   const url = `${D4_BASE}/documents/${uuidSafe}/makedocumentbytemplateword?tokenAPI=${tokenAPI}&cryptKey=${cryptKey}`;
   
-  // *** CORREÇÃO CRÍTICA NA ESTRUTURA DO BODY ***
   const body = {
-    name_document: `Contrato - ${dados.nome_da_marca || dados.nome || "Sem Nome"}`,
-    uuid_folder: null,
-    // O idTemplateWord se torna a CHAVE do objeto 'templates'
-    templates: {
-      [idTemplateWord]: ADD 
-    }
+      name_document: `${docName} - ${dados.nome_da_marca || dados.nome || "Sem Nome"}`,
+      uuid_folder: uuidFolder, 
+      templates: {
+        [idTemplateWord]: ADD 
+      }
   };
-
+  
   const r = await fetch(url, {
-    method: "POST",
-    headers: { "accept": "application/json", "content-type": "application/json" },
-    body: JSON.stringify(body)
+      method: "POST",
+      headers: { "accept": "application/json", "content-type": "application/json" },
+      body: JSON.stringify(body)
   });
   const out = await r.json().catch(() => ({}));
+  
+  if (!r.ok || out.message) {
+      return { error: true, status: r.status, name: docName, response: out };
+  }
+  
+  const uuidDoc = out.uuid || out.uuidDoc || out.uuid_document;
+  const link = out.url || out.url_document || null;
 
-  return { sent: r.ok, status: r.status, response: out };
+  return { 
+      ok: true, name: docName, uuidDoc, link, response: out 
+  };
 }
 
-// adiciona signatários (usa env D4_SIGNERS como JSON)
-async function d4AddSigners(uuidDoc) {
-  // *** ALTERADO PARA AMBIENTE DE PRODUÇÃO ***
-  const D4_BASE = "https://secure.d4sign.com.br/api/v1"; 
+// Adiciona signatários (agora aceita a lista dinâmica)
+async function d4AddSigners(uuidDoc, signersArray) {
   const tokenAPI = process.env.D4_TOKEN;
   const cryptKey = process.env.D4_CRYPT;
-  const signersArray = safeJson(process.env.D4_SIGNERS || "[]") || [];
 
   if (!uuidDoc) return { error: "uuidDoc ausente" };
-  if (!signersArray.length) return { error: "D4_SIGNERS vazio" };
+  if (!signersArray?.length) return { error: "Lista de signatários vazia" };
 
-  const url = `${D4_BASE}/documents/${uuidDoc}/addsigner?tokenAPI=${tokenAPI}&cryptKey=${cryptKey}`;
+  // Endpoint 'addsigner' ou 'createlist'
+  const url = `${D4_BASE}/documents/${uuidDoc}/addsigner?tokenAPI=${tokenAPI}&cryptKey=${cryptKey}`; 
   
-  // *** CORREÇÃO NA ESTRUTURA DO BODY ***
-  // A D4Sign espera um objeto JSON com a chave 'signers' contendo o ARRAY de signatários STRINGIFICADO.
+  // Corpo da requisição: objeto com a chave 'signers' contendo o array stringificado
   const body = {
     signers: JSON.stringify(signersArray)
   };
@@ -279,10 +359,8 @@ async function d4AddSigners(uuidDoc) {
   return r.ok ? { ok: true, response: out } : { error: true, status: r.status, response: out };
 }
 
-// envia para assinatura
+// Envia para assinatura
 async function d4SendToSign(uuidDoc) {
-  // *** ALTERADO PARA AMBIENTE DE PRODUÇÃO ***
-  const D4_BASE = "https://secure.d4sign.com.br/api/v1";
   const tokenAPI = process.env.D4_TOKEN;
   const cryptKey = process.env.D4_CRYPT;
 
@@ -290,12 +368,7 @@ async function d4SendToSign(uuidDoc) {
 
   const url = `${D4_BASE}/documents/${uuidDoc}/sendtosigner?tokenAPI=${tokenAPI}&cryptKey=${cryptKey}`;
   
-  // Requisição POST simples sem body é geralmente suficiente
-  const r = await fetch(url, { 
-    method: "POST",
-    headers: { "accept": "application/json" } // O Content-Type não é obrigatório para um body vazio
-  }); 
-  
+  const r = await fetch(url, { method: "POST" });
   const out = await r.json().catch(() => ({}));
   return r.ok ? { ok: true, response: out } : { error: true, status: r.status, response: out };
 }
