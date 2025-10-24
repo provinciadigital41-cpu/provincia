@@ -195,14 +195,13 @@ export async function handler(event) {
       }).then(r => r.json());
 
     const CARD_Q = `
-      query($cardId: ID!) {
-        card(id: $cardId) {
-          id title
-          fields { name value report_value field { id } }
-          assignees { id name } 
-        }
-      }
-    `;
+  query($cardId: ID!) {
+    card(id: $cardId) {
+      id
+      title
+    }
+  }
+`;
     const cardRes = await gql(CARD_Q, { cardId });
     
     if (cardRes.errors) {
