@@ -20,19 +20,13 @@ function parseCurrencyBRL(s) {
   const n = Number(String(s).replace(/[^\d\,]/g, "").replace(",", "."));
   return Number.isFinite(n) ? Number(n.toFixed(2)) : null;
 }
-// Funções auxiliares omitidas por espaço, mas devem estar no seu arquivo completo
-/*
-function parseParcelas(s) { const m = String(s||"").match(/(\d+)/); return m ? Number(m[1]) : null; }
-function parseTaxa(s) { ... }
-function parseDocumentoURL(v) { ... }
-*/
+// Outras helpers devem estar aqui (parseParcelas, parseTaxa, etc.)
 
 
-/* ================== FUNÇÕES DE DADOS PIPEFY (CORRIGIDAS) ================== */
+/* ================== FUNÇÕES DE DADOS PIPEFY ================== */
 
-// AGORA RECEBE O OBJETO CARD INTEIRO
 function montarDadosContrato(card) {
-  const fields = card?.fields || []; // Para campos normais
+  const fields = card?.fields || [];
   
   // --- Leitura de campos normais (exemplo) ---
   const nome                = toStr(getField(fields, "nome_do_contato"));
@@ -46,25 +40,23 @@ function montarDadosContrato(card) {
   const responsaveis = card?.assignees || [];
   
   if (responsaveis.length > 0) {
-      // Pega o nome do PRIMEIRO responsável na lista.
       vendedor = toStr(responsaveis[0].name); 
   }
   
   return {
     nome, nome_da_marca, email,
     valor_do_negocio, 
-    vendedor // NOME COMPLETO DO VENDEDOR
+    vendedor
     // ... retorne todos os outros dados
   };
 }
 
 function montarADD(d) {
-  // As chaves devem ser IDÊNTICAS às variáveis no seu template Word
   return {
     "NOME_CLIENTE": d.nome,
     "EMAIL_CLIENTE": d.email,
     "VALOR_NEGOCIO": d.valor_do_negocio,
-    // ... continue preenchendo todos os campos que o template precisa
+    // ...
   };
 }
 
@@ -77,7 +69,6 @@ function getCofreDataPorVendedor(vendedor) {
         .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
         .trim();
     
-    // Mapeamento fornecido (sem acentos, minúsculas)
     const MAPA_COFRES = {
         "mauro furlan neto": { uuidSafe: "623b7ae4-5c01-4cff-a7e4-5b0a9f58af07" },
         "brenda rosa da silva": { uuidSafe: "b6dd6fad-c9fe-4cf1-8a90-6488d2537930" },
@@ -92,33 +83,19 @@ function getCofreDataPorVendedor(vendedor) {
     };
     
     if (MAPA_COFRES[chave]) {
-        return { 
-            uuidSafe: MAPA_COFRES[chave].uuidSafe,
-            uuidFolder: null 
-        };
+        return { uuidSafe: MAPA_COFRES[chave].uuidSafe, uuidFolder: null };
     }
-    return {
-        uuidSafe: process.env.D4_UUID_SAFE_PADRAO || null,
-        uuidFolder: null 
-    };
+    return { uuidSafe: process.env.D4_UUID_SAFE_PADRAO || null, uuidFolder: null };
 }
 
 function montarSignatarios(dados) {
-    const signatarioCliente = {
-        "email": dados.email,
-        "act": "1", "foreign": "0", "certificadoicpbr": "0"
-    };
-
-    const signatarioEmpresa = {
-        "email": process.env.EMAIL_ASSINATURA_EMPRESA,
-        "act": "1", "foreign": "0", "certificadoicpbr": "0"
-    };
+    const signatarioCliente = { "email": dados.email, "act": "1", "foreign": "0", "certificadoicpbr": "0" };
+    const signatarioEmpresa = { "email": process.env.EMAIL_ASSINATURA_EMPRESA, "act": "1", "foreign": "0", "certificadoicpbr": "0" };
     
     if (!process.env.EMAIL_ASSINATURA_EMPRESA) {
         console.error("Variável EMAIL_ASSINATURA_EMPRESA ausente.");
         return [signatarioCliente]; 
     }
-
     return [signatarioCliente, signatarioEmpresa];
 }
 
@@ -138,16 +115,10 @@ async function processarDocumentoD4(ADD, dados, uuidSafe, idTemplateWord, docNam
   const body = {
       name_document: `${docName} - ${dados.nome_da_marca || dados.nome || "Sem Nome"}`,
       uuid_folder: uuidFolder, 
-      templates: {
-        [idTemplateWord]: ADD 
-      }
+      templates: { [idTemplateWord]: ADD }
   };
   
-  const r = await fetch(url, {
-      method: "POST",
-      headers: { "accept": "application/json", "content-type": "application/json" },
-      body: JSON.stringify(body)
-  });
+  const r = await fetch(url, { method: "POST", headers: { "accept": "application/json", "content-type": "application/json" }, body: JSON.stringify(body) });
   const out = await r.json().catch(() => ({}));
   
   if (!r.ok || out.message) {
@@ -157,26 +128,16 @@ async function processarDocumentoD4(ADD, dados, uuidSafe, idTemplateWord, docNam
   const uuidDoc = out.uuid || out.uuidDoc || out.uuid_document;
   const link = out.url || out.url_document || null;
 
-  return { 
-      ok: true, name: docName, uuidDoc, link, response: out 
-  };
+  return { ok: true, name: docName, uuidDoc, link, response: out };
 }
 
 async function d4AddSigners(uuidDoc, signersArray) {
   const tokenAPI = process.env.D4_TOKEN;
   const cryptKey = process.env.D4_CRYPT;
-
   const url = `${D4_BASE}/documents/${uuidDoc}/addsigner?tokenAPI=${tokenAPI}&cryptKey=${cryptKey}`; 
-  
-  const body = {
-    signers: JSON.stringify(signersArray)
-  };
+  const body = { signers: JSON.stringify(signersArray) };
 
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "accept": "application/json", "content-type": "application/json" },
-    body: JSON.stringify(body)
-  });
+  const r = await fetch(url, { method: "POST", headers: { "accept": "application/json", "content-type": "application/json" }, body: JSON.stringify(body) });
   const out = await r.json().catch(() => ({}));
   return r.ok ? { ok: true, response: out } : { error: true, status: r.status, response: out, details: `Erro ao adicionar: ${out.mensagem_pt || out.message}` };
 }
@@ -184,7 +145,6 @@ async function d4AddSigners(uuidDoc, signersArray) {
 async function d4SendToSign(uuidDoc) {
   const tokenAPI = process.env.D4_TOKEN;
   const cryptKey = process.env.D4_CRYPT;
-
   const url = `${D4_BASE}/documents/${uuidDoc}/sendtosigner?tokenAPI=${tokenAPI}&cryptKey=${cryptKey}`;
   
   const r = await fetch(url, { method: "POST" });
@@ -193,23 +153,29 @@ async function d4SendToSign(uuidDoc) {
 }
 
 
-/* ================== HANDLER PRINCIPAL (FLUXO) ================== */
+/* ================== HANDLER PRINCIPAL (FLUXO - COM DEBUG) ================== */
 
 export async function handler(event) {
   try {
-    const body = safeJson(event.body) || {};
-    const cardId =
-      body?.data?.card?.id ??
-      body?.card?.id ??
-      body?.data?.id ??
-      body?.cardId ??
-      null;
+    if (event.httpMethod === "GET") { return text(200, "OK - use POST"); }
+    if (event.httpMethod !== "POST") return text(405, "Method Not Allowed");
 
-    console.log(`[CHECK 1] Card ID recebido: ${cardId}`);
+    // --- CORREÇÃO: LEITURA ROBUSTA DO BODY E DEBUG ---
+    const body = safeJson(event.body);
+    let cardId = null;
+
+    if (body) {
+        // 1. Tenta ler do formato padrão {"cardId": ...}
+        cardId = body?.data?.card?.id ?? body?.card?.id ?? body?.data?.id ?? body?.cardId ?? null;
+    } 
+    // Se o body for string e não JSON, o Pipefy pode estar enviando o cardId direto ou texto.
+    // Não precisamos de um log específico aqui, a falha do 'cardId' nos dirá o suficiente.
+    
+    console.log(`[CHECK 1] Card ID processado: ${cardId}`);
 
     if (!cardId) {
-      console.error("ERRO [FALHA 1]: cardId ausente. Abortando.");
-      return json(400, { error: "cardId ausente. Revise o Webhook Body no Pipefy." });
+        console.error("ERRO [FALHA 1]: cardId ausente. Tentativa de Body RAW:", event.body);
+        return json(400, { error: "cardId ausente. Revise o Body do Webhook no Pipefy." });
     }
 
     const PIPEFY_TOKEN = process.env.PIPEFY_TOKEN;
@@ -224,19 +190,14 @@ export async function handler(event) {
     const gql = (query, variables) =>
       fetch("https://api.pipefy.com/graphql", {
         method: "POST",
-        headers: {
-          "Authorization": `Bearer ${PIPEFY_TOKEN}`,
-          "Content-Type": "application/json"
-        },
+        headers: { "Authorization": `Bearer ${PIPEFY_TOKEN}`, "Content-Type": "application/json" },
         body: JSON.stringify({ query, variables })
       }).then(r => r.json());
 
-    // CORREÇÃO DA QUERY: Busca o nome do responsável via assignees
     const CARD_Q = `
       query($cardId: ID!) {
         card(id: $cardId) {
-          id
-          title
+          id title
           fields { name value report_value field { id } }
           assignees { id name } 
         }
@@ -252,13 +213,12 @@ export async function handler(event) {
     const card = cardRes?.data?.card;
     if (!card) {
          console.error("ERRO [FALHA 3.1]: Card não encontrado no Pipefy.");
-         return json(404, { error: "Card não encontrado ou token sem permissão para visualizá-lo." });
+         return json(404, { error: "Card não encontrado, ID inválido ou token sem permissão." });
     }
 
     console.log(`[CHECK 3 SUCESSO] Card '${card?.title}' buscado.`);
 
     // === DADOS E COFRE ===
-    // CORREÇÃO: Passa o objeto 'card' inteiro, pois 'vendedor' vem de 'card.assignees'
     const dados = montarDadosContrato(card); 
     const ADD = montarADD(dados);
     const signersList = montarSignatarios(dados);
@@ -266,14 +226,14 @@ export async function handler(event) {
     
     if (!cofreData?.uuidSafe) {
         console.error(`ERRO [FALHA 4]: Vendedor '${dados.vendedor}' não mapeado.`);
-        return json(400, { error: `Vendedor '${dados.vendedor}' não mapeado ou campo 'respons_vel' estava vazio.` });
+        return json(400, { error: `Vendedor '${dados.vendedor}' não mapeado. Ajuste a função getCofreDataPorVendedor.` });
     }
     
     const DYNAMIC_UUID_SAFE = cofreData.uuidSafe;
     const DYNAMIC_UUID_FOLDER = cofreData.uuidFolder;
     
     // === 3. CRIAÇÃO DOS DOCUMENTOS (D4Sign) ===
-    console.log(`[CHECK 5] Iniciando criação dos 3 documentos no Cofre: ${DYNAMIC_UUID_SAFE}`);
+    console.log(`[CHECK 5] Iniciando criação dos 3 docs no Cofre: ${DYNAMIC_UUID_SAFE}`);
 
     const docProcuracao = await processarDocumentoD4(ADD, dados, DYNAMIC_UUID_SAFE, process.env.D4_ID_TEMPLATE_PROCURACAO, "Procuração", DYNAMIC_UUID_FOLDER);
     if (docProcuracao.error) return json(502, { error: "Falha Procuração D4Sign", details: docProcuracao.details, response: docProcuracao.response });
@@ -291,29 +251,19 @@ export async function handler(event) {
     // === 4. ASSINATURA DOS DOCUMENTOS (D4Sign) ===
     for (const doc of allDocs) {
         if (!doc.uuidDoc) continue;
-
         console.log(`[CHECK 6] Processando signatários e envio para: ${doc.name}`);
 
         const addS = await d4AddSigners(doc.uuidDoc, signersList);
-        if (addS?.error) {
-            signSendResults.push({ name: doc.name, status: "addSigner_ERROR", details: addS.details });
-            continue;
-        }
+        if (addS?.error) { signSendResults.push({ name: doc.name, status: "addSigner_ERROR", details: addS.details }); continue; }
 
         const send = await d4SendToSign(doc.uuidDoc);
-        if (send?.error) {
-            signSendResults.push({ name: doc.name, status: "sendToSign_ERROR", details: send.details });
-        } else {
-            signSendResults.push({ name: doc.name, status: "OK" });
-        }
+        if (send?.error) { signSendResults.push({ name: doc.name, status: "sendToSign_ERROR", details: send.details }); } 
+        else { signSendResults.push({ name: doc.name, status: "OK" }); }
         
-        if (doc.name === "Contrato") {
-             linkContrato = doc.link; 
-        }
+        if (doc.name === "Contrato") { linkContrato = doc.link; }
     }
 
     // === 5. ATUALIZAR PIPEFY ===
-    
     const LINK_FIELD = process.env.PIPEFY_FIELD_LINK_CONTRATO || "documentos"; 
     if (linkContrato) {
       const MUT_UPDATE = `mutation($card_id: ID!, $field_id: String!, $value: String!) { updateCardField(input: { card_id: $card_id, field_id: $field_id, new_value: $value }) { success } }`;
