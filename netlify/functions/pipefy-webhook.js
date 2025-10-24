@@ -20,40 +20,41 @@ function parseCurrencyBRL(s) {
   const n = Number(String(s).replace(/[^\d\,]/g, "").replace(",", "."));
   return Number.isFinite(n) ? Number(n.toFixed(2)) : null;
 }
+// Funções auxiliares omitidas por espaço, mas devem estar no seu arquivo completo
+/*
 function parseParcelas(s) { const m = String(s||"").match(/(\d+)/); return m ? Number(m[1]) : null; }
-function parseTaxa(s) {
-  if (!s) return { categoria: null, valor: null };
-  const cat = String(s).split("(")[0].trim();
-  const m = String(s).match(/R\$\s*([\d\.\,]+)/i);
-  const valor = m ? parseCurrencyBRL(m[1]) : null;
-  return { categoria: cat || null, valor };
-}
-function parseDocumentoURL(v) {
-  if (!v) return null;
-  try { if (String(v).trim().startsWith("[")) { const arr = JSON.parse(v); return Array.isArray(arr) ? arr[0] ?? null : null; } } catch {}
-  return String(v);
-}
+function parseTaxa(s) { ... }
+function parseDocumentoURL(v) { ... }
+*/
 
 
-/* ================== FUNÇÕES DE DADOS PIPEFY ================== */
+/* ================== FUNÇÕES DE DADOS PIPEFY (CORRIGIDAS) ================== */
 
-function montarDadosContrato(fields) {
-  // Use os IDs dos campos do Pipefy
+// AGORA RECEBE O OBJETO CARD INTEIRO
+function montarDadosContrato(card) {
+  const fields = card?.fields || []; // Para campos normais
+  
+  // --- Leitura de campos normais (exemplo) ---
   const nome                = toStr(getField(fields, "nome_do_contato"));
   const nome_da_marca       = toStr(getField(fields, "neg_cio"));
   const email               = toStr(getField(fields, "email_profissional"));
   const valorBruto          = getField(fields, "valor_do_neg_cio");
-  
-  // ATENÇÃO: ID DO VENDEDOR CONFIRMADO
-  const vendedor            = toStr(getField(fields, "respons_vel"));
-  
   const valor_do_negocio    = parseCurrencyBRL(valorBruto);
+
+  // --- CORREÇÃO: Leitura do Responsável (Assignee) ---
+  let vendedor = null;
+  const responsaveis = card?.assignees || [];
+  
+  if (responsaveis.length > 0) {
+      // Pega o nome do PRIMEIRO responsável na lista.
+      vendedor = toStr(responsaveis[0].name); 
+  }
   
   return {
     nome, nome_da_marca, email,
     valor_do_negocio, 
-    vendedor
-    // ... retorne todos os dados lidos do Pipefy
+    vendedor // NOME COMPLETO DO VENDEDOR
+    // ... retorne todos os outros dados
   };
 }
 
@@ -113,9 +114,8 @@ function montarSignatarios(dados) {
         "act": "1", "foreign": "0", "certificadoicpbr": "0"
     };
     
-    // ATENÇÃO: Se EMAIL_ASSINATURA_EMPRESA estiver faltando, retorna apenas o cliente
     if (!process.env.EMAIL_ASSINATURA_EMPRESA) {
-        console.error("Variável EMAIL_ASSINATURA_EMPRESA ausente. Apenas o cliente será listado como signatário.");
+        console.error("Variável EMAIL_ASSINATURA_EMPRESA ausente.");
         return [signatarioCliente]; 
     }
 
@@ -231,12 +231,14 @@ export async function handler(event) {
         body: JSON.stringify({ query, variables })
       }).then(r => r.json());
 
+    // CORREÇÃO DA QUERY: Busca o nome do responsável via assignees
     const CARD_Q = `
       query($cardId: ID!) {
         card(id: $cardId) {
           id
           title
           fields { name value report_value field { id } }
+          assignees { id name } 
         }
       }
     `;
@@ -248,18 +250,23 @@ export async function handler(event) {
     }
     
     const card = cardRes?.data?.card;
-    const fields = card?.fields || [];
+    if (!card) {
+         console.error("ERRO [FALHA 3.1]: Card não encontrado no Pipefy.");
+         return json(404, { error: "Card não encontrado ou token sem permissão para visualizá-lo." });
+    }
+
     console.log(`[CHECK 3 SUCESSO] Card '${card?.title}' buscado.`);
 
     // === DADOS E COFRE ===
-    const dados = montarDadosContrato(fields);
+    // CORREÇÃO: Passa o objeto 'card' inteiro, pois 'vendedor' vem de 'card.assignees'
+    const dados = montarDadosContrato(card); 
     const ADD = montarADD(dados);
     const signersList = montarSignatarios(dados);
     const cofreData = getCofreDataPorVendedor(dados.vendedor);
     
     if (!cofreData?.uuidSafe) {
         console.error(`ERRO [FALHA 4]: Vendedor '${dados.vendedor}' não mapeado.`);
-        return json(400, { error: "Vendedor não mapeado. Ajuste a função getCofreDataPorVendedor." });
+        return json(400, { error: `Vendedor '${dados.vendedor}' não mapeado ou campo 'respons_vel' estava vazio.` });
     }
     
     const DYNAMIC_UUID_SAFE = cofreData.uuidSafe;
